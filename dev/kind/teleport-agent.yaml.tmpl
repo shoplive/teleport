@@ -1,0 +1,113 @@
+# Teleport Kubernetes agent running INSIDE the kind cluster.
+# Joins the Shoplive teleport cluster via the static token configured in
+# dev/teleport.yaml's auth_service.tokens, registers itself as a kube
+# resource named "shoplive-kind", and impersonates incoming requests via the
+# pod's ServiceAccount. cluster-admin RBAC is dev-only — production should
+# use the upstream teleport-kube-agent helm chart's narrower role.
+#
+# `@TELEPORT_IP@` and `@KEYCLOAK_IP@` are substituted by dev/scripts/kind-up.sh
+# from `docker inspect` so pods can resolve teleport.shoplive.local /
+# keycloak.shoplive.local even though they don't sit on the docker bridge
+# DNS path that the host uses.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: teleport-agent
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: teleport-kube-agent
+  namespace: teleport-agent
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: teleport-kube-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: teleport-kube-agent
+    namespace: teleport-agent
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: teleport-kube-agent-config
+  namespace: teleport-agent
+data:
+  teleport.yaml: |
+    version: v3
+    teleport:
+      nodename: shoplive-kind
+      data_dir: /var/lib/teleport
+      auth_token: dev-static-shoplive-token
+      proxy_server: teleport.shoplive.local:3080
+      log:
+        severity: INFO
+        output: stderr
+
+    auth_service:
+      enabled: no
+    proxy_service:
+      enabled: no
+    ssh_service:
+      enabled: no
+
+    kubernetes_service:
+      enabled: yes
+      kube_cluster_name: shoplive-kind
+      labels:
+        env: dev
+        engine: kubernetes
+        zone: a
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: teleport-kube-agent
+  namespace: teleport-agent
+  labels:
+    app: teleport-kube-agent
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: teleport-kube-agent
+  template:
+    metadata:
+      labels:
+        app: teleport-kube-agent
+    spec:
+      serviceAccountName: teleport-kube-agent
+      hostAliases:
+        - ip: "@TELEPORT_IP@"
+          hostnames:
+            - teleport.shoplive.local
+        - ip: "@KEYCLOAK_IP@"
+          hostnames:
+            - keycloak.shoplive.local
+      containers:
+        - name: teleport
+          image: shoplive/teleport-dev:latest
+          imagePullPolicy: IfNotPresent
+          command: ["teleport", "start", "--config=/etc/teleport/teleport.yaml"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/teleport/teleport.yaml
+              subPath: teleport.yaml
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/teleport
+      volumes:
+        - name: config
+          configMap:
+            name: teleport-kube-agent-config
+        - name: data
+          emptyDir: {}

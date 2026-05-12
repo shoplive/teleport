@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Host-side wrapper that runs `tsh` inside the running shoplive-teleport
+# container — useful as an alias or in PATH so `tsh ...` Just Works without
+# an installed binary on the host.
+#
+#   alias tsh="$REPO/dev/bin/tsh"
+#   # or
+#   export PATH="$REPO/dev/bin:$PATH"
+#
+# Notes:
+#   - tsh state lives at /root/.tsh inside the container; lost on `make destroy`.
+#   - For SSO (OIDC) login, the OAuth callback listener must be reachable from
+#     the macOS browser. Use `make oidc-login` or pass:
+#       --bind-addr=0.0.0.0:38000 --callback=http://localhost:38000
+#     (port 38000 is forwarded out of the container in docker-compose.yml.)
+
+set -euo pipefail
+
+DEV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if ! (cd "$DEV_DIR" && docker compose ps --status running --services 2>/dev/null | grep -q '^teleport$'); then
+  echo "ERROR: shoplive-teleport container is not running. Run 'make up' in $DEV_DIR." >&2
+  exit 1
+fi
+
+# -t allocates a pseudo-tty when stdout is one, so password prompts / progress
+# bars work but pipelines (`tsh ls | grep ...`) still behave correctly.
+EXEC_FLAGS=()
+if [[ -t 1 ]]; then
+  EXEC_FLAGS+=(-t)
+fi
+
+exec docker compose -f "$DEV_DIR/docker-compose.yml" exec "${EXEC_FLAGS[@]}" teleport tsh "$@"

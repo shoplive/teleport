@@ -1,0 +1,50 @@
+kind: role
+version: v7
+metadata:
+  name: shoplive-admin
+  description: Full-access role for local development. Do not ship to production.
+spec:
+  options:
+    max_session_ttl: 8h0m0s
+    forward_agent: true
+  allow:
+    # Any of these system users on a node accepts the SSH cert. The OS-level
+    # users are created in dev/Dockerfile so a session actually opens.
+    # {{external.preferred_username}} resolves from the OIDC claim of the
+    # same name (e.g. "dev" / "alice"), so users get a login matching their
+    # IdP identity automatically.
+    logins:
+      - root
+      - dev
+      - alice
+      - jeff
+      - ubuntu
+      - '{{external.preferred_username}}'
+    node_labels:
+      '*': '*'
+
+    # Kubernetes — admin gets cluster-admin on every registered cluster via
+    # the system:masters group. Username is the OIDC preferred_username.
+    kubernetes_labels:
+      '*': '*'
+    kubernetes_groups:
+      - system:masters
+    kubernetes_users:
+      - '{{external.preferred_username}}'
+
+    # Database access (when DB resources are registered).
+    db_labels:
+      '*': '*'
+    db_users:
+      - '{{external.preferred_username}}'
+      - dev
+      - alice
+      - jeff
+      - ubuntu
+      - postgres
+    db_names:
+      - '*'
+
+    rules:
+      - resources: ['*']
+        verbs: ['*']
