@@ -125,6 +125,21 @@ func NewGithubConnectors(connectors []types.GithubConnector) ([]ResourceItem, er
 	return items, nil
 }
 
+// NewOIDCConnectors creates a resource item for each OIDC connector.
+// Shoplive fork — exposed in the Web UI so the AuthConnectors page can list
+// the in-house OIDC connectors next to GitHub ones.
+func NewOIDCConnectors(connectors []types.OIDCConnector) ([]ResourceItem, error) {
+	items := make([]ResourceItem, 0, len(connectors))
+	for _, connector := range connectors {
+		item, err := NewResourceItem(connector)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		items = append(items, *item)
+	}
+	return items, nil
+}
+
 // NewTrustedClusters creates resource item for each cluster.
 func NewTrustedClusters(clusters []types.TrustedCluster) ([]ResourceItem, error) {
 	items := make([]ResourceItem, 0, len(clusters))

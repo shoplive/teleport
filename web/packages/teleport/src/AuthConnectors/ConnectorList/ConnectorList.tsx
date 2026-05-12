@@ -45,6 +45,13 @@ export function ConnectorList<T extends KindAuthConnectors>({
 
     const Icon = getSsoIcon(kind, name);
 
+    // Shoplive fork: this OSS UI only ships an editor for `github`. OIDC
+    // connectors are read-only here (managed via `tctl create -f`); hiding
+    // Edit/Delete prevents the GitHubConnectorEditor from being routed to
+    // for an OIDC connector and surfacing a "github connector ... is not
+    // configured" error.
+    const editorAvailable = kind === 'github';
+
     return (
       <AuthConnectorTile
         key={id}
@@ -56,12 +63,39 @@ export function ConnectorList<T extends KindAuthConnectors>({
         }
         onSetAsDefault={() => setAsDefault({ type: kind, name })}
         isPlaceholder={false}
-        onEdit={() => navigate(cfg.getEditAuthConnectorRoute(kind, name))}
-        onDelete={onDelete}
+        onEdit={
+          editorAvailable
+            ? () => navigate(cfg.getEditAuthConnectorRoute(kind, name))
+            : undefined
+        }
+        onDelete={editorAvailable ? onDelete : undefined}
         name={name}
+        customDesc={
+          editorAvailable
+            ? undefined
+            : `${kind.toUpperCase()} Connector — managed via tctl`
+        }
       />
     );
   });
+
+  // Shoplive fork: always render a GitHub placeholder tile if no GitHub
+  // connector is configured yet, so the kind is discoverable next to OIDC
+  // / SAML entries instead of being hidden.
+  const hasGithub = items.some(item => item.kind === 'github');
+  const githubPlaceholder = !hasGithub && (
+    <AuthConnectorTile
+      key="github-placeholder"
+      kind="github"
+      id="github-placeholder"
+      Icon={getSsoIcon('github', 'github')}
+      isDefault={false}
+      isPlaceholder={true}
+      onSetup={() => navigate(cfg.getCreateAuthConnectorRoute('github'))}
+      name="GitHub"
+      customDesc="Not configured"
+    />
+  );
 
   return (
     <AuthConnectorsGrid>
@@ -70,6 +104,7 @@ export function ConnectorList<T extends KindAuthConnectors>({
         setAsDefault={() => setAsDefault({ type: 'local' })}
       />
       {$items}
+      {githubPlaceholder}
     </AuthConnectorsGrid>
   );
 }
