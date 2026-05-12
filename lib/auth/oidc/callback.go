@@ -1,0 +1,450 @@
+/*
+ * Teleport — Shoplive fork
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+package oidc
+
+import (
+	"context"
+	"net/url"
+	"time"
+
+	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/gravitational/trace"
+	"golang.org/x/oauth2"
+
+	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/constants"
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
+	apievents "github.com/gravitational/teleport/api/types/events"
+	"github.com/gravitational/teleport/api/utils/keys/hardwarekey"
+	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/authz"
+	"github.com/gravitational/teleport/lib/events"
+	"github.com/gravitational/teleport/lib/loginrule"
+	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/utils"
+)
+
+// ValidateOIDCAuthCallback finishes the OIDC SSO flow. It exchanges the auth
+// code for tokens, verifies the ID-token signature + claims, maps claims to
+// roles via the connector's claims_to_roles, upserts the Teleport user, and
+// returns a Web session and/or SSH+TLS certs depending on what the original
+// auth request asked for.
+func (s *Service) ValidateOIDCAuthCallback(ctx context.Context, q url.Values) (*authclient.OIDCAuthResponse, error) {
+	resp, err := s.validateCallback(ctx, q)
+	// Skip the user.login audit event on a successful MFA round-trip — the
+	// caller (mfa service) emits its own MFA-specific audit. Failures and
+	// regular login flows still emit here.
+	if err != nil || resp == nil || resp.MFAToken == "" {
+		s.emitLoginEvent(ctx, resp, err, q)
+	}
+	return resp, trace.Wrap(err)
+}
+
+func (s *Service) validateCallback(ctx context.Context, q url.Values) (*authclient.OIDCAuthResponse, error) {
+	// Surface IdP-side errors ("error", "error_description") directly.
+	if errParam := q.Get("error"); errParam != "" {
+		return nil, trace.AccessDenied("OIDC IdP returned error %q: %s", errParam, q.Get("error_description"))
+	}
+
+	state := q.Get("state")
+	code := q.Get("code")
+	switch {
+	case state == "":
+		return nil, trace.BadParameter("missing 'state' query parameter")
+	case code == "":
+		return nil, trace.BadParameter("missing 'code' query parameter")
+	}
+
+	// Recover the original auth request (also gives us the persisted PKCE
+	// verifier + nonce). Storage TTLs the request, so an expired/replayed
+	// state surfaces here.
+	req, err := s.auth.Services.GetOIDCAuthRequest(ctx, state)
+	if err != nil {
+		return nil, trace.Wrap(err, "looking up OIDC auth request for state")
+	}
+
+	connector, err := s.auth.GetOIDCConnector(ctx, req.ConnectorID, true)
+	if err != nil {
+		return nil, trace.Wrap(err, "loading OIDC connector %q", req.ConnectorID)
+	}
+
+	provider, err := s.providers.get(ctx, connector.GetIssuerURL())
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Token exchange.
+	oauth2Config := oauth2.Config{
+		ClientID:     connector.GetClientID(),
+		ClientSecret: connector.GetClientSecret(),
+		RedirectURL:  pickRedirectURL(connector),
+		Endpoint:     provider.Endpoint(),
+	}
+	exchangeOpts := []oauth2.AuthCodeOption{}
+	if req.PkceVerifier != "" {
+		exchangeOpts = append(exchangeOpts, oauth2.VerifierOption(req.PkceVerifier))
+	}
+	token, err := oauth2Config.Exchange(ctx, code, exchangeOpts...)
+	if err != nil {
+		return nil, trace.AccessDenied("OIDC token exchange failed: %v", err)
+	}
+
+	rawIDToken, ok := token.Extra("id_token").(string)
+	if !ok || rawIDToken == "" {
+		return nil, trace.AccessDenied("OIDC token response missing id_token")
+	}
+
+	// ID-token verification: signature against JWKS, iss/aud/exp/iat.
+	verifier := provider.Verifier(&oidc.Config{ClientID: connector.GetClientID()})
+	idToken, err := verifier.Verify(ctx, rawIDToken)
+	if err != nil {
+		return nil, trace.AccessDenied("OIDC id_token verification failed: %v", err)
+	}
+
+	// Nonce check.
+	expectedNonce := extractNonce(req)
+	if expectedNonce != "" && idToken.Nonce != expectedNonce {
+		return nil, trace.AccessDenied("OIDC nonce mismatch")
+	}
+
+	// Pull claims as a free-form map; merge userinfo if connector requests it.
+	var claims map[string]any
+	if err := idToken.Claims(&claims); err != nil {
+		return nil, trace.Wrap(err, "decoding id_token claims")
+	}
+	if claims == nil {
+		claims = map[string]any{}
+	}
+	if err := mergeUserInfo(ctx, provider, token, &claims); err != nil {
+		s.logger.WarnContext(ctx, "Failed to fetch userinfo (continuing with id_token claims only)", "error", err)
+	}
+
+	// Translate claims → traits → role list.
+	traits := claimsToTraits(claims)
+
+	// Apply Login Rules so admins can rewrite/augment traits before they
+	// reach claims_to_roles. Mirrors lib/auth/github.go.
+	evalOut, err := s.auth.GetLoginRuleEvaluator().Evaluate(ctx, &loginrule.EvaluationInput{
+		Traits: traits,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err, "evaluating login rules")
+	}
+	traits = evalOut.Traits
+	if len(evalOut.AppliedRules) > 0 {
+		s.logger.InfoContext(ctx, "OIDC login rules applied",
+			"connector", connector.GetName(),
+			"applied_rules", evalOut.AppliedRules,
+		)
+	}
+
+	username := usernameFromClaims(connector, traits)
+	if username == "" {
+		return nil, trace.AccessDenied("OIDC claims did not yield a username (none of preferred_username/email/sub were present)")
+	}
+
+	// Per-session MFA flow short-circuits here. BeginSSOMFAChallenge marked
+	// `req.CheckUser=true` and persisted an MFA session keyed by the state
+	// token; we just need to verify the IdP-authenticated identity matches
+	// and mint an MFAToken. No user upsert, no session/cert issuance.
+	if req.CheckUser {
+		return s.handleMFACallback(ctx, req, username, connector.GetName())
+	}
+
+	roleWarnings, roles := services.TraitsToRoles(connector.GetTraitMappings(), traits)
+	if len(roles) == 0 {
+		s.logger.WarnContext(ctx, "OIDC claims mapped to no roles",
+			"connector", connector.GetName(),
+			"username", username,
+			"warnings", roleWarnings,
+		)
+		return nil, trace.AccessDenied("OIDC user %q has no matching roles via claims_to_roles", username)
+	}
+
+	// Resolve session TTL bounded by the role's max TTL and the requested cert TTL.
+	resolved, err := services.FetchRolesWithContext(roles, s.auth, services.RoleTemplateContext{
+		Username: username,
+		Traits:   traits,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	roleTTL := resolved.AdjustSessionTTL(apidefaults.MaxCertDuration)
+	sessionTTL := utils.MinTTL(roleTTL, req.CertTTL)
+	if sessionTTL <= 0 {
+		sessionTTL = roleTTL
+	}
+
+	// Upsert the user — in test flow we skip mutating the backend.
+	user, err := s.upsertUser(ctx, connector.GetName(), username, roles, traits, sessionTTL, req.SSOTestFlow)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Login hooks (e.g. usage reporting, login state). Mirror the GitHub flow.
+	if !req.SSOTestFlow {
+		if err := s.auth.CallLoginHooks(ctx, user); err != nil {
+			s.logger.WarnContext(ctx, "OIDC login hooks returned an error", "error", err)
+		}
+	}
+
+	userState, err := s.auth.GetUserOrLoginState(ctx, user.GetName())
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	identity := types.ExternalIdentity{
+		ConnectorID: connector.GetName(),
+		Username:    username,
+	}
+
+	if req.SSOTestFlow {
+		return &authclient.OIDCAuthResponse{
+			Req:      authclient.OIDCAuthRequest{ConnectorID: req.ConnectorID, CSRFToken: req.CSRFToken},
+			Identity: identity,
+			Username: username,
+		}, nil
+	}
+
+	return s.makeAuthResponse(ctx, req, userState, identity, sessionTTL)
+}
+
+// makeAuthResponse mirrors auth.makeGithubAuthResponse — produces a Web
+// session, SSH+TLS certs, or both depending on what the original request asked
+// for.
+func (s *Service) makeAuthResponse(
+	ctx context.Context,
+	req *types.OIDCAuthRequest,
+	userState services.UserState,
+	identity types.ExternalIdentity,
+	sessionTTL time.Duration,
+) (*authclient.OIDCAuthResponse, error) {
+	resp := &authclient.OIDCAuthResponse{
+		Req: authclient.OIDCAuthRequest{
+			ConnectorID:       req.ConnectorID,
+			CSRFToken:         req.CSRFToken,
+			PublicKey:         nil,
+			SSHPubKey:         req.SshPublicKey,
+			TLSPubKey:         req.TlsPublicKey,
+			CreateWebSession:  req.CreateWebSession,
+			ClientRedirectURL: req.ClientRedirectURL,
+		},
+		Identity: identity,
+		Username: userState.GetName(),
+	}
+
+	if req.CreateWebSession {
+		session, err := s.auth.CreateWebSessionFromReq(ctx, auth.NewWebSessionRequest{
+			User:                 userState.GetName(),
+			Roles:                userState.GetRoles(),
+			Traits:               userState.GetTraits(),
+			SessionTTL:           sessionTTL,
+			LoginTime:            s.auth.GetClock().Now().UTC(),
+			LoginIP:              req.ClientLoginIP,
+			LoginUserAgent:       req.ClientUserAgent,
+			AttestWebSession:     true,
+			CreateDeviceWebToken: true,
+			Scope:                req.Scope,
+		})
+		if err != nil {
+			return nil, trace.Wrap(err, "creating Web session")
+		}
+		resp.Session = session
+	}
+
+	if len(req.SshPublicKey) != 0 || len(req.TlsPublicKey) != 0 {
+		sshCert, tlsCert, err := s.auth.CreateSessionCerts(ctx, &auth.SessionCertsRequest{
+			UserState:               userState,
+			SessionTTL:              sessionTTL,
+			SSHPubKey:               req.SshPublicKey,
+			TLSPubKey:               req.TlsPublicKey,
+			SSHAttestationStatement: hardwarekey.AttestationStatementFromProto(req.SshAttestationStatement),
+			TLSAttestationStatement: hardwarekey.AttestationStatementFromProto(req.TlsAttestationStatement),
+			Compatibility:           req.Compatibility,
+			RouteToCluster:          req.RouteToCluster,
+			KubernetesCluster:       req.KubernetesCluster,
+			LoginIP:                 req.ClientLoginIP,
+			Scope:                   req.Scope,
+		})
+		if err != nil {
+			return nil, trace.Wrap(err, "issuing session certs")
+		}
+
+		clusterName, err := s.auth.GetClusterName(ctx)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		hostCA, err := s.auth.GetCertAuthority(ctx, types.CertAuthID{
+			Type:       types.HostCA,
+			DomainName: clusterName.GetClusterName(),
+		}, false)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		resp.Cert = sshCert
+		resp.TLSCert = tlsCert
+		resp.HostSigners = append(resp.HostSigners, hostCA)
+	}
+
+	if opts, err := s.auth.ClientOptionsForLogin(userState); err == nil {
+		resp.ClientOptions = opts
+	}
+
+	return resp, nil
+}
+
+// handleMFACallback completes the SSO-driven per-session MFA flow.
+// The OIDC dance was just performed for an already-known Teleport user, so
+// we don't upsert anything new — we just confirm the IdP-asserted identity
+// matches the user who initiated the MFA challenge, then mint an MFA token.
+func (s *Service) handleMFACallback(
+	ctx context.Context,
+	req *types.OIDCAuthRequest,
+	idpUsername string,
+	connectorName string,
+) (*authclient.OIDCAuthResponse, error) {
+	sd, err := s.auth.GetMFASession(ctx, req.StateToken)
+	if err != nil {
+		return nil, trace.Wrap(err, "looking up MFA session for state %q", req.StateToken)
+	}
+	if sd.Username != idpUsername {
+		return nil, trace.AccessDenied(
+			"OIDC MFA user mismatch: session expects %q, IdP returned %q",
+			sd.Username, idpUsername,
+		)
+	}
+
+	mfaToken, err := s.auth.UpsertMFASessionWithToken(ctx, sd)
+	if err != nil {
+		return nil, trace.Wrap(err, "issuing MFA token")
+	}
+
+	return &authclient.OIDCAuthResponse{
+		Req: authclient.OIDCAuthRequest{
+			ConnectorID: req.ConnectorID,
+			CSRFToken:   req.CSRFToken,
+		},
+		Identity: types.ExternalIdentity{
+			ConnectorID: connectorName,
+			Username:    idpUsername,
+		},
+		Username: idpUsername,
+		MFAToken: mfaToken,
+	}, nil
+}
+
+func (s *Service) upsertUser(
+	ctx context.Context,
+	connectorName, username string,
+	roles []string,
+	traits map[string][]string,
+	sessionTTL time.Duration,
+	dryRun bool,
+) (types.User, error) {
+	expires := s.auth.GetClock().Now().UTC().Add(sessionTTL)
+
+	user := &types.UserV2{
+		Kind:    types.KindUser,
+		Version: types.V2,
+		Metadata: types.Metadata{
+			Name:      username,
+			Namespace: apidefaults.Namespace,
+			Expires:   &expires,
+		},
+		Spec: types.UserSpecV2{
+			Roles:  roles,
+			Traits: traits,
+			OIDCIdentities: []types.ExternalIdentity{{
+				ConnectorID: connectorName,
+				Username:    username,
+			}},
+			CreatedBy: types.CreatedBy{
+				User: types.UserRef{Name: teleport.UserSystem},
+				Time: s.auth.GetClock().Now().UTC(),
+				Connector: &types.ConnectorRef{
+					Type:     constants.OIDC,
+					ID:       connectorName,
+					Identity: username,
+				},
+			},
+		},
+	}
+
+	if dryRun {
+		return user, nil
+	}
+
+	existing, err := s.auth.Services.GetUser(ctx, username, false)
+	if err != nil && !trace.IsNotFound(err) {
+		return nil, trace.Wrap(err)
+	}
+
+	if existing != nil {
+		ref := user.GetCreatedBy().Connector
+		if !ref.IsSameProvider(existing.GetCreatedBy().Connector) {
+			return nil, trace.AlreadyExists("user %q already exists and was not created by this OIDC connector", username)
+		}
+		user.SetRevision(existing.GetRevision())
+		updated, err := s.auth.UpdateUser(ctx, user)
+		return updated, trace.Wrap(err)
+	}
+
+	created, err := s.auth.CreateUser(ctx, user)
+	return created, trace.Wrap(err)
+}
+
+func (s *Service) emitLoginEvent(ctx context.Context, resp *authclient.OIDCAuthResponse, loginErr error, q url.Values) {
+	event := &apievents.UserLogin{
+		Metadata: apievents.Metadata{
+			Type: events.UserLoginEvent,
+		},
+		Method:             events.LoginMethodOIDC,
+		ConnectionMetadata: authz.ConnectionMetadata(ctx),
+	}
+	if loginErr != nil {
+		event.Code = events.UserSSOLoginFailureCode
+		event.Status.Success = false
+		event.Status.Error = trace.Unwrap(loginErr).Error()
+		event.Status.UserMessage = loginErr.Error()
+	} else {
+		event.Code = events.UserSSOLoginCode
+		event.Status.Success = true
+		if resp != nil {
+			event.User = resp.Username
+		}
+	}
+	if err := s.auth.EmitAuditEvent(ctx, event); err != nil {
+		s.logger.WarnContext(ctx, "Failed to emit OIDC login audit event", "error", err)
+	}
+}
+
+// mergeUserInfo augments id_token claims with /userinfo fields. Some IdPs
+// (Google in particular) split claims between the ID token and userinfo.
+func mergeUserInfo(ctx context.Context, p *oidc.Provider, tok *oauth2.Token, claims *map[string]any) error {
+	ui, err := p.UserInfo(ctx, oauth2.StaticTokenSource(tok))
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	var extra map[string]any
+	if err := ui.Claims(&extra); err != nil {
+		return trace.Wrap(err)
+	}
+	for k, v := range extra {
+		if _, exists := (*claims)[k]; exists {
+			continue
+		}
+		(*claims)[k] = v
+	}
+	return nil
+}
+

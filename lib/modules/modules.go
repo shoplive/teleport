@@ -400,6 +400,11 @@ func (p *defaultModules) Features() Features {
 			entitlements.Desktop:            {Enabled: true, Limit: 0},
 			entitlements.JoinActiveSessions: {Enabled: true, Limit: 0},
 			entitlements.K8s:                {Enabled: true, Limit: 0},
+			// Shoplive fork: OIDC SSO is implemented in lib/auth/oidc as the
+			// in-house replacement for the upstream enterprise-only impl.
+			// See OIDC stub at lib/auth/oidc.go and the wiring in
+			// lib/service/service.go (SetOIDCService).
+			entitlements.OIDC: {Enabled: true, Limit: 0},
 		},
 	}
 }
