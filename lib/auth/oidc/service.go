@@ -185,9 +185,11 @@ func (s *Service) createAuthRequest(ctx context.Context, req types.OIDCAuthReque
 		return nil, trace.Wrap(err)
 	}
 
+	// `state` is the CSRF token and the lookup key for the persisted auth
+	// request — treat it as a secret. Log only metadata that lets us trace
+	// the flow without enabling replay/lookup.
 	s.logger.InfoContext(ctx, "OIDC auth request created",
 		"connector", req.ConnectorID,
-		"state", state,
 		"issuer", connector.GetIssuerURL(),
 		"redirect_uri", redirectURI,
 		"pkce", req.PkceVerifier != "",

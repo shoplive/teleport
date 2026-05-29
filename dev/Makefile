@@ -7,7 +7,9 @@
 #   make up        first-time bring-up (build image + start everything)
 #   make rebuild   edit Go code -> rebuild image -> restart teleport (data preserved)
 #   make hot-reload  rebuild on every change via Compose's watch + auto-restart
-#   make down      stop everything (volumes wiped)
+#   make down      stop containers (state PRESERVED — Postgres + teleport data
+#                  volumes survive; `make up` resumes the same cluster)
+#   make destroy   stop AND delete volumes (full wipe — only use to reset state)
 #   make tctl ARGS="..."   run tctl inside the teleport container
 #   make tsh  ARGS="..."   run tsh  inside the teleport container
 

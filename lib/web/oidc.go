@@ -120,7 +120,15 @@ func (h *Handler) oidcLoginConsole(w http.ResponseWriter, r *http.Request, p htt
 // Mirrors githubCallback.
 func (h *Handler) oidcCallback(w http.ResponseWriter, r *http.Request, p httprouter.Params) string {
 	logger := h.logger.With("auth", "oidc")
-	logger.DebugContext(r.Context(), "Callback start", "query", r.URL.Query())
+	// Never log the raw query string — it carries `code` and `state`,
+	// which are sensitive (auth-code reuse / CSRF lookup secret). Record
+	// only presence flags + the IdP-side error code, which is safe.
+	q := r.URL.Query()
+	logger.DebugContext(r.Context(), "Callback start",
+		"has_state", q.Get("state") != "",
+		"has_code", q.Get("code") != "",
+		"idp_error", q.Get("error"),
+	)
 
 	response, err := h.cfg.ProxyClient.ValidateOIDCAuthCallback(r.Context(), r.URL.Query())
 	if err != nil {

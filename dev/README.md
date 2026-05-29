@@ -121,9 +121,9 @@ make go ARGS="mod tidy"                # any other go command
 
 These run `go test` inside a fresh `golang:1.25-bookworm` container; the build/mod caches are persisted in two named Docker volumes (`shoplive-go-build-cache`, `shoplive-go-mod-cache`), so subsequent runs are fast.
 
-### End-to-end SSO round-trip (current shim — Phase 3 done, Phase 4 pending)
+### End-to-end SSO round-trip
 
-The OIDC RP shim at `lib/auth/oidc/` is wired up: `tsh login --auth=keycloak` actually builds a real Keycloak auth URL and opens the flow. Callback validation (token exchange, ID-token verification, user upsert) is the next milestone — until then the flow ends in a `NotImplemented` from the shim, **not** the original "OIDC is only available in Teleport Enterprise" upsell.
+The in-house OIDC RP at `lib/auth/oidc/` is complete: `tsh login --auth=keycloak` builds a real Keycloak auth URL, walks the user through Keycloak (login + TOTP), and the callback handler exchanges the code, verifies the ID token (incl. nonce + PKCE), maps claims to a Teleport user, upserts it, and issues a session + SSH cert. This is **not** the original "OIDC is only available in Teleport Enterprise" upsell — that path is intentionally short-circuited by the in-house service.
 
 1. Apply the connector once: `make bootstrap-oidc`
 2. Trigger SSO login:
@@ -134,19 +134,20 @@ The OIDC RP shim at `lib/auth/oidc/` is wired up: `tsh login --auth=keycloak` ac
 
    This invokes `tsh login --auth=keycloak --bind-addr=0.0.0.0:38000 --callback=http://localhost:38000`. tsh's callback listener binds inside the container on port 38000, which is forwarded to the macOS host (see `docker-compose.yml`).
 
-   Expected flow (current shim):
+   Expected flow:
 
    ```
    tsh prints  http://localhost:38000  →  open in macOS browser
    browser → https://localhost:3080            (proxy redirects to Keycloak)
    browser → http://localhost:8080/realms/shoplive/...   (Keycloak login + TOTP)
    browser → https://localhost:3080/v1/webapi/oidc/callback
-            └─ proxy calls Service.ValidateOIDCAuthCallback → returns
-               "OIDC callback validation not implemented yet (Shoplive SSO Phase 4)"
-   tsh    →  prints the same error and exits non-zero
+            └─ proxy calls Service.ValidateOIDCAuthCallback
+               (token exchange → ID-token verify → claim mapping → user upsert)
+            └─ proxy posts session + SSH cert back to tsh's local listener
+   tsh    →  writes the new identity into ~/.tsh and exits 0
    ```
 
-   That's the "흉내" boundary: the auth-request half works, the callback half is stubbed. To inspect what arrived from Keycloak, tail teleport logs (`make logs`) — the shim logs `state_present`, `code_present`, and any IdP-side `error` / `error_description` query parameters.
+   To inspect what arrived from Keycloak, tail teleport logs (`make logs`) — the callback handler logs presence flags (`has_state`, `has_code`) and any IdP-side `error` / `error_description` query parameters. Raw `state`/`code` values are intentionally not logged.
 
    For a quick "did the URL build correctly?" check without going through the browser: `make tsh ARGS="login --proxy=localhost:3080 --insecure --auth=keycloak --browser=off"` prints the Keycloak authz URL. Inspect the URL — it should target `/realms/shoplive/protocol/openid-connect/auth` with `client_id=teleport-proxy`, `response_type=code`, the `state` token, and the configured `scope`.
 

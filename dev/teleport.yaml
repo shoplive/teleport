@@ -19,9 +19,11 @@ auth_service:
   tokens:
     - "node,kube,db,app:dev-static-shoplive-token"
   authentication:
-    # While the OIDCService implementation is in progress, fall back to local
-    # users (created via tctl users add). Switch to type: oidc after Phase 5
-    # of the SSO build lands.
+    # OIDCService is fully implemented (lib/auth/oidc) and `tsh login
+    # --auth=keycloak` works end-to-end. We deliberately keep `type: local`
+    # as the default in dev so there's always a break-glass path (local
+    # tctl-created admin) when Keycloak is rebuilt / wiped / misconfigured.
+    # Production sets `type: oidc` with `connector_name: keycloak` instead.
     type: local
     second_factors:
       - otp
