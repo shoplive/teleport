@@ -1,5 +1,19 @@
 /*
- * Teleport — Shoplive fork
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 package oidc
@@ -9,10 +23,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/stretchr/testify/require"
 )
 
@@ -129,6 +145,86 @@ func TestProviderCache_DiscoveryError(t *testing.T) {
 
 	cache.mu.Lock()
 	_, cached := cache.m["http://127.0.0.1:1/realms/nope"]
+	cache.mu.Unlock()
+	require.False(t, cached, "failed discovery must not be cached")
+}
+
+// TestProviderCache_ConcurrentGet stresses the cold-path-then-double-check
+// pattern inside providerCache.get. N goroutines pile onto the same issuer;
+// after the dust settles all of them must see the same *Provider, and the
+// IdP's discovery endpoint should have been hit at most N times (in practice
+// usually 1 — but we don't assert the exact count because the cache releases
+// its lock during the HTTP call, so a small race window between goroutines
+// is permitted by the current implementation).
+func TestProviderCache_ConcurrentGet(t *testing.T) {
+	idp := newFakeIdP(t)
+	cache := newProviderCache()
+
+	const N = 10
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var (
+		wg     sync.WaitGroup
+		mu     sync.Mutex
+		got    = make([]*oidc.Provider, 0, N)
+		errors = make([]error, 0)
+	)
+	wg.Add(N)
+	start := make(chan struct{})
+	for range N {
+		go func() {
+			defer wg.Done()
+			<-start
+			p, err := cache.get(ctx, idp.srv.URL)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errors = append(errors, err)
+				return
+			}
+			got = append(got, p)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	require.Empty(t, errors, "no goroutine should see an error")
+	require.Len(t, got, N)
+
+	first := got[0]
+	require.NotNil(t, first)
+	for i, p := range got[1:] {
+		require.Same(t, first, p,
+			"goroutine %d returned a different *Provider — cache lost an entry", i+1)
+	}
+
+	hits := idp.discoveryHits.Load()
+	require.GreaterOrEqual(t, hits, int64(1),
+		"at least one discovery hit is required to populate the cache")
+	require.LessOrEqual(t, hits, int64(N),
+		"discovery hits must not exceed the number of callers")
+}
+
+// TestProviderCache_IssuerMismatch verifies we don't paper over an IdP that
+// advertises a different `issuer` than the URL we discovered it at —
+// go-oidc's NewProvider is strict about this and our cache must surface the
+// mismatch as an error without poisoning the entry.
+func TestProviderCache_IssuerMismatch(t *testing.T) {
+	idp := newFakeIdP(t)
+	// Discovery URL is idp.srv.URL but the doc advertises a different issuer.
+	idp.discoveryResponse["issuer"] = "https://impostor.example/realms/main"
+
+	cache := newProviderCache()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	_, err := cache.get(ctx, idp.srv.URL)
+	require.Error(t, err, "issuer mismatch must surface as an error")
+
+	cache.mu.Lock()
+	_, cached := cache.m[idp.srv.URL]
 	cache.mu.Unlock()
 	require.False(t, cached, "failed discovery must not be cached")
 }

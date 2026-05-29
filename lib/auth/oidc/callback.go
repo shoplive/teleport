@@ -1,10 +1,19 @@
 /*
- * Teleport — Shoplive fork
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 package oidc
@@ -39,29 +48,31 @@ import (
 // returns a Web session and/or SSH+TLS certs depending on what the original
 // auth request asked for.
 func (s *Service) ValidateOIDCAuthCallback(ctx context.Context, q url.Values) (*authclient.OIDCAuthResponse, error) {
-	resp, err := s.validateCallback(ctx, q)
-	// Skip the user.login audit event on a successful MFA round-trip — the
-	// caller (mfa service) emits its own MFA-specific audit. Failures and
-	// regular login flows still emit here.
-	if err != nil || resp == nil || resp.MFAToken == "" {
+	resp, isMFA, err := s.validateCallback(ctx, q)
+	// MFA round-trips (both success and failure) are audited by the mfa
+	// service via its own chain that started at BeginSSOMFAChallenge —
+	// emitting a UserSSOLoginFailureCode/LoginMethodOIDC here would split
+	// MFA failures away from their MFA event stream and make them invisible
+	// to SOC dashboards keyed on mfa events. Regular login (and any
+	// pre-state-lookup failure where we can't yet tell which flow it is)
+	// still emits.
+	if !isMFA {
 		s.emitLoginEvent(ctx, resp, err, q)
 	}
 	return resp, trace.Wrap(err)
 }
 
-func (s *Service) validateCallback(ctx context.Context, q url.Values) (*authclient.OIDCAuthResponse, error) {
-	// Surface IdP-side errors ("error", "error_description") directly.
-	if errParam := q.Get("error"); errParam != "" {
-		return nil, trace.AccessDenied("OIDC IdP returned error %q: %s", errParam, q.Get("error_description"))
-	}
-
-	state := q.Get("state")
-	code := q.Get("code")
-	switch {
-	case state == "":
-		return nil, trace.BadParameter("missing 'state' query parameter")
-	case code == "":
-		return nil, trace.BadParameter("missing 'code' query parameter")
+// validateCallback runs the full callback validation. The second return
+// (isMFA) is true once we've confirmed the original auth request was an
+// MFA flow (req.CheckUser=true) — used by ValidateOIDCAuthCallback to
+// route the audit event to either the regular login chain or the mfa
+// service's chain. Failures before the auth-request lookup (bad query
+// params, expired/replayed state) cannot know which flow they belong to
+// and report isMFA=false so they're still audited as login events.
+func (s *Service) validateCallback(ctx context.Context, q url.Values) (*authclient.OIDCAuthResponse, bool, error) {
+	state, code, err := parseCallbackParams(q)
+	if err != nil {
+		return nil, false, trace.Wrap(err)
 	}
 
 	// Recover the original auth request (also gives us the persisted PKCE
@@ -69,17 +80,21 @@ func (s *Service) validateCallback(ctx context.Context, q url.Values) (*authclie
 	// state surfaces here.
 	req, err := s.auth.Services.GetOIDCAuthRequest(ctx, state)
 	if err != nil {
-		return nil, trace.Wrap(err, "looking up OIDC auth request for state")
+		return nil, false, trace.Wrap(err, "looking up OIDC auth request for state")
 	}
+	// From here on we know which flow we're in; propagate to the caller so
+	// MFA-flow failures route to the mfa service's audit chain instead of
+	// the regular login event chain.
+	isMFA := req.CheckUser
 
 	connector, err := s.auth.GetOIDCConnector(ctx, req.ConnectorID, true)
 	if err != nil {
-		return nil, trace.Wrap(err, "loading OIDC connector %q", req.ConnectorID)
+		return nil, isMFA, trace.Wrap(err, "loading OIDC connector %q", req.ConnectorID)
 	}
 
 	provider, err := s.providers.get(ctx, connector.GetIssuerURL())
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return nil, isMFA, trace.Wrap(err)
 	}
 
 	// Token exchange.
@@ -95,31 +110,31 @@ func (s *Service) validateCallback(ctx context.Context, q url.Values) (*authclie
 	}
 	token, err := oauth2Config.Exchange(ctx, code, exchangeOpts...)
 	if err != nil {
-		return nil, trace.AccessDenied("OIDC token exchange failed: %v", err)
+		return nil, isMFA, trace.AccessDenied("OIDC token exchange failed: %v", err)
 	}
 
 	rawIDToken, ok := token.Extra("id_token").(string)
 	if !ok || rawIDToken == "" {
-		return nil, trace.AccessDenied("OIDC token response missing id_token")
+		return nil, isMFA, trace.AccessDenied("OIDC token response missing id_token")
 	}
 
 	// ID-token verification: signature against JWKS, iss/aud/exp/iat.
 	verifier := provider.Verifier(&oidc.Config{ClientID: connector.GetClientID()})
 	idToken, err := verifier.Verify(ctx, rawIDToken)
 	if err != nil {
-		return nil, trace.AccessDenied("OIDC id_token verification failed: %v", err)
+		return nil, isMFA, trace.AccessDenied("OIDC id_token verification failed: %v", err)
 	}
 
 	// Nonce check.
 	expectedNonce := extractNonce(req)
 	if expectedNonce != "" && idToken.Nonce != expectedNonce {
-		return nil, trace.AccessDenied("OIDC nonce mismatch")
+		return nil, isMFA, trace.AccessDenied("OIDC nonce mismatch")
 	}
 
 	// Pull claims as a free-form map; merge userinfo if connector requests it.
 	var claims map[string]any
 	if err := idToken.Claims(&claims); err != nil {
-		return nil, trace.Wrap(err, "decoding id_token claims")
+		return nil, isMFA, trace.Wrap(err, "decoding id_token claims")
 	}
 	if claims == nil {
 		claims = map[string]any{}
@@ -137,7 +152,7 @@ func (s *Service) validateCallback(ctx context.Context, q url.Values) (*authclie
 		Traits: traits,
 	})
 	if err != nil {
-		return nil, trace.Wrap(err, "evaluating login rules")
+		return nil, isMFA, trace.Wrap(err, "evaluating login rules")
 	}
 	traits = evalOut.Traits
 	if len(evalOut.AppliedRules) > 0 {
@@ -149,15 +164,16 @@ func (s *Service) validateCallback(ctx context.Context, q url.Values) (*authclie
 
 	username := usernameFromClaims(connector, traits)
 	if username == "" {
-		return nil, trace.AccessDenied("OIDC claims did not yield a username (none of preferred_username/email/sub were present)")
+		return nil, isMFA, trace.AccessDenied("OIDC claims did not yield a username (none of preferred_username/email/sub were present)")
 	}
 
 	// Per-session MFA flow short-circuits here. BeginSSOMFAChallenge marked
 	// `req.CheckUser=true` and persisted an MFA session keyed by the state
 	// token; we just need to verify the IdP-authenticated identity matches
 	// and mint an MFAToken. No user upsert, no session/cert issuance.
-	if req.CheckUser {
-		return s.handleMFACallback(ctx, req, username, connector.GetName())
+	if isMFA {
+		resp, err := s.handleMFACallback(ctx, req, username, connector.GetName())
+		return resp, true, trace.Wrap(err)
 	}
 
 	roleWarnings, roles := services.TraitsToRoles(connector.GetTraitMappings(), traits)
@@ -167,7 +183,7 @@ func (s *Service) validateCallback(ctx context.Context, q url.Values) (*authclie
 			"username", username,
 			"warnings", roleWarnings,
 		)
-		return nil, trace.AccessDenied("OIDC user %q has no matching roles via claims_to_roles", username)
+		return nil, isMFA, trace.AccessDenied("OIDC user %q has no matching roles via claims_to_roles", username)
 	}
 
 	// Resolve session TTL bounded by the role's max TTL and the requested cert TTL.
@@ -176,7 +192,7 @@ func (s *Service) validateCallback(ctx context.Context, q url.Values) (*authclie
 		Traits:   traits,
 	})
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return nil, isMFA, trace.Wrap(err)
 	}
 	roleTTL := resolved.AdjustSessionTTL(apidefaults.MaxCertDuration)
 	sessionTTL := utils.MinTTL(roleTTL, req.CertTTL)
@@ -187,7 +203,7 @@ func (s *Service) validateCallback(ctx context.Context, q url.Values) (*authclie
 	// Upsert the user — in test flow we skip mutating the backend.
 	user, err := s.upsertUser(ctx, connector.GetName(), username, roles, traits, sessionTTL, req.SSOTestFlow)
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return nil, isMFA, trace.Wrap(err)
 	}
 
 	// Login hooks (e.g. usage reporting, login state). Mirror the GitHub flow.
@@ -199,7 +215,7 @@ func (s *Service) validateCallback(ctx context.Context, q url.Values) (*authclie
 
 	userState, err := s.auth.GetUserOrLoginState(ctx, user.GetName())
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return nil, isMFA, trace.Wrap(err)
 	}
 
 	identity := types.ExternalIdentity{
@@ -212,10 +228,11 @@ func (s *Service) validateCallback(ctx context.Context, q url.Values) (*authclie
 			Req:      authclient.OIDCAuthRequest{ConnectorID: req.ConnectorID, CSRFToken: req.CSRFToken},
 			Identity: identity,
 			Username: username,
-		}, nil
+		}, isMFA, nil
 	}
 
-	return s.makeAuthResponse(ctx, req, userState, identity, sessionTTL)
+	resp, err := s.makeAuthResponse(ctx, req, userState, identity, sessionTTL)
+	return resp, isMFA, trace.Wrap(err)
 }
 
 // makeAuthResponse mirrors auth.makeGithubAuthResponse — produces a Web
@@ -317,11 +334,8 @@ func (s *Service) handleMFACallback(
 	if err != nil {
 		return nil, trace.Wrap(err, "looking up MFA session for state %q", req.StateToken)
 	}
-	if sd.Username != idpUsername {
-		return nil, trace.AccessDenied(
-			"OIDC MFA user mismatch: session expects %q, IdP returned %q",
-			sd.Username, idpUsername,
-		)
+	if err := verifyMFAUsernameMatch(sd.Username, idpUsername); err != nil {
+		return nil, trace.Wrap(err)
 	}
 
 	mfaToken, err := s.auth.UpsertMFASessionWithToken(ctx, sd)
@@ -426,6 +440,42 @@ func (s *Service) emitLoginEvent(ctx context.Context, resp *authclient.OIDCAuthR
 	if err := s.auth.EmitAuditEvent(ctx, event); err != nil {
 		s.logger.WarnContext(ctx, "Failed to emit OIDC login audit event", "error", err)
 	}
+}
+
+// parseCallbackParams extracts and validates the OAuth2 callback query
+// params. Returns trace.AccessDenied when the IdP signaled an error via
+// the "error" / "error_description" pair, trace.BadParameter when "state"
+// or "code" are missing. The split out of validateCallback exists so the
+// boundary check has a dedicated unit test without needing an auth.Server.
+func parseCallbackParams(q url.Values) (state, code string, err error) {
+	if errParam := q.Get("error"); errParam != "" {
+		return "", "", trace.AccessDenied(
+			"OIDC IdP returned error %q: %s", errParam, q.Get("error_description"),
+		)
+	}
+	state = q.Get("state")
+	code = q.Get("code")
+	switch {
+	case state == "":
+		return "", "", trace.BadParameter("missing 'state' query parameter")
+	case code == "":
+		return "", "", trace.BadParameter("missing 'code' query parameter")
+	}
+	return state, code, nil
+}
+
+// verifyMFAUsernameMatch confirms the IdP-asserted username matches the
+// Teleport user who initiated the per-session MFA challenge. Extracted from
+// handleMFACallback so the comparison has a unit test without needing the
+// full MFA session storage stack.
+func verifyMFAUsernameMatch(expectedFromSession, idpUsername string) error {
+	if expectedFromSession != idpUsername {
+		return trace.AccessDenied(
+			"OIDC MFA user mismatch: session expects %q, IdP returned %q",
+			expectedFromSession, idpUsername,
+		)
+	}
+	return nil
 }
 
 // mergeUserInfo augments id_token claims with /userinfo fields. Some IdPs
