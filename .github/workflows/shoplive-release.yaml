@@ -1,0 +1,147 @@
+name: shoplive teleport image publish
+
+# Builds the production multi-arch (amd64+arm64) image and pushes to ECR.
+# Triggered by:
+#   - Tag push matching v*-shoplive.*  (e.g. v19.0.0-shoplive.1) — production
+#     release path. Tag name becomes a stable image tag alongside the commit
+#     SHA.
+#   - workflow_dispatch with an optional `tag` input — ad-hoc rebuilds.
+#
+# ECR repository devops/platform/teleport is provisioned on first push
+# (scanOnPush=true, IMMUTABLE) — mirrors matrix-zk-exporter-publish.yml.
+
+on:
+  push:
+    tags:
+      - 'v*-shoplive.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Additional image tag (e.g. canary-2026-05-29). Always pushed alongside the git SHA.'
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on:
+      group: shoplive-devops
+    env:
+      ECR_REGISTRY: 015116979309.dkr.ecr.ap-northeast-2.amazonaws.com
+      ECR_REPO: devops/platform/teleport
+      AWS_REGION: ap-northeast-2
+      AWS_ROLE_ARN: arn:aws:iam::015116979309:role/github-actions-egami-ecr
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve image tags
+        id: tag
+        # Always include ${GITHUB_SHA} (immutable, traceable). Add the git tag
+        # name on a tag push, and the workflow_dispatch input if supplied.
+        # All tags are comma-separated and prefixed with the full ECR URI so
+        # docker/build-push-action consumes them directly.
+        #
+        # The dispatch input is bound via env (never interpolated into the run
+        # block) and validated against the docker-tag charset so an attacker
+        # with workflow_dispatch can't smuggle shell metacharacters onto a
+        # runner that holds id-token: write + the ECR role.
+        env:
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${DISPATCH_TAG}" && ! "${DISPATCH_TAG}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Invalid dispatch tag (only [A-Za-z0-9._-] allowed): ${DISPATCH_TAG}"
+            exit 1
+          fi
+          tags=("${GITHUB_SHA}")
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tags+=("${GITHUB_REF#refs/tags/}")
+          fi
+          if [[ -n "${DISPATCH_TAG}" ]]; then
+            tags+=("${DISPATCH_TAG}")
+          fi
+          full=""
+          for t in "${tags[@]}"; do
+            full+="${ECR_REGISTRY}/${ECR_REPO}:${t},"
+          done
+          echo "value=${full%,}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup AWS CLI
+        uses: unfor19/install-aws-cli-action@v1
+        with:
+          version: 2
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'amd64' }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure ECR repository exists
+        # scanOnPush + IMMUTABLE — a given SHA / git tag is push-once.
+        # Concurrent-tag-push race: if two workflows race between describe and
+        # create, the loser sees RepositoryAlreadyExistsException — treated as
+        # success so the publish step proceeds.
+        shell: bash
+        run: |
+          set -euo pipefail
+          if aws ecr describe-repositories --repository-names "${ECR_REPO}" --region "${AWS_REGION}" > /dev/null 2>&1; then
+            echo "ECR repo already exists: ${ECR_REPO}"
+          else
+            echo "Creating ECR repo: ${ECR_REPO}"
+            if ! aws ecr create-repository \
+                --repository-name "${ECR_REPO}" \
+                --region "${AWS_REGION}" \
+                --image-scanning-configuration scanOnPush=true \
+                --image-tag-mutability IMMUTABLE 2> /tmp/ecr_err; then
+              if grep -q "RepositoryAlreadyExistsException" /tmp/ecr_err; then
+                echo "ECR repo created concurrently — continuing"
+              else
+                cat /tmp/ecr_err >&2
+                exit 1
+              fi
+            fi
+          fi
+
+      - name: Login to ECR
+        shell: bash
+        run: |
+          aws ecr get-login-password --region "${AWS_REGION}" | \
+            docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tag.outputs.value }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        env:
+          TAGS: ${{ steps.tag.outputs.value }}
+        shell: bash
+        run: |
+          {
+            echo "### shoplive-teleport image publish"
+            for t in $(echo "${TAGS}" | tr ',' '\n'); do
+              echo "- \`${t}\`"
+            done
+            echo "- platforms: linux/amd64, linux/arm64"
+          } >> "$GITHUB_STEP_SUMMARY"

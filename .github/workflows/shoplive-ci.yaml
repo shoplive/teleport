@@ -1,0 +1,53 @@
+name: shoplive teleport CI
+
+# PR + master push gate for the Shoplive in-house OIDC implementation.
+# Scoped to lib/auth/oidc/... — running the full upstream test suite on every
+# PR is prohibitively expensive on a fork that consumes upstream as-is.
+# Expand the test target once additional fork-owned packages appear.
+
+on:
+  pull_request:
+    branches:
+      - master
+    paths:
+      # Only paths whose changes are actually exercised by the test target
+      # below (./lib/auth/oidc/...). Widen this filter when the test target
+      # itself widens — wiring files (lib/auth/oidc.go, lib/web/oidc.go,
+      # lib/auth/apiserver.go, lib/web/apiserver.go, lib/modules/modules.go,
+      # lib/service/service.go) are not unit-tested here and would trigger
+      # green CI on changes the suite doesn't actually cover.
+      - 'lib/auth/oidc/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/shoplive-ci.yaml'
+  push:
+    branches:
+      - master
+    paths:
+      - 'lib/auth/oidc/**'
+      - 'go.mod'
+      - 'go.sum'
+
+permissions:
+  contents: read
+
+jobs:
+  test-oidc:
+    runs-on:
+      group: shoplive-devops
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Test lib/auth/oidc
+        # Containerized to keep the runner image free of a host Go toolchain.
+        # Matches dev/Dockerfile's golang:1.25-bookworm — same compiler version
+        # both dev and CI exercise.
+        shell: bash
+        run: |
+          docker run --rm \
+            -v "${PWD}":/src \
+            -w /src \
+            -e GOFLAGS=-buildvcs=false \
+            golang:1.25-bookworm \
+            go test -count=1 -race ./lib/auth/oidc/...
