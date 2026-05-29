@@ -13,6 +13,11 @@
 
 FROM golang:1.25-bookworm AS builder
 
+# TARGETARCH is injected by BuildKit for each platform leg (amd64 / arm64).
+# Used below to give each leg its own Go build-cache bucket so parallel
+# multi-arch builds cannot corrupt each other's cache.
+ARG TARGETARCH
+
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
@@ -41,8 +46,7 @@ WORKDIR /src
 # Pre-pull Go modules so source edits don't reinvoke `go mod download`.
 COPY go.mod go.sum ./
 COPY api/go.mod api/go.sum ./api/
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    --mount=type=cache,target=/go/pkg/mod \
+RUN --mount=type=cache,target=/go/pkg/mod \
     go mod download
 
 COPY . .
@@ -55,7 +59,7 @@ COPY . .
 #   RDPCLIENT_SKIP_BUILD=1 — skip building the server-side Rust RDP client.
 #   FIDO2=off              — no libfido2/U2F; TOTP via Keycloak + per-session
 #                            MFA at the SSO layer suffices for prod.
-RUN --mount=type=cache,target=/root/.cache/go-build \
+RUN --mount=type=cache,id=go-build-${TARGETARCH},target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.local/share/pnpm \
     --mount=type=cache,target=/root/.cache/pnpm \
@@ -80,7 +84,7 @@ COPY --from=builder /src/build/teleport /usr/local/bin/teleport
 COPY --from=builder /src/build/tctl     /usr/local/bin/tctl
 COPY --from=builder /src/build/tsh      /usr/local/bin/tsh
 
-# 3023 reverse-tunnel, 3024 auth-tunnel, 3025 auth API, 3080 proxy web.
+# 3023 SSH proxy, 3024 reverse-tunnel, 3025 auth API, 3080 proxy web.
 EXPOSE 3023 3024 3025 3080
 
 ENTRYPOINT ["/usr/local/bin/teleport"]
