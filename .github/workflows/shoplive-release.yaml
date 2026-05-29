@@ -49,22 +49,37 @@ jobs:
         # block) and validated against the docker-tag charset so an attacker
         # with workflow_dispatch can't smuggle shell metacharacters onto a
         # runner that holds id-token: write + the ECR role.
+        #
+        # Validation applies to all caller-controlled tag inputs (git tag push
+        # AND workflow_dispatch input). git_sha is always 40-char hex so it
+        # bypasses validation. Rejecting early in this step gives a clear error
+        # at the runner instead of an opaque docker push failure.
         env:
           DISPATCH_TAG: ${{ github.event.inputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -n "${DISPATCH_TAG}" && ! "${DISPATCH_TAG}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
-            echo "::error::Invalid dispatch tag (Docker tag spec: ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$): ${DISPATCH_TAG}"
-            exit 1
-          fi
+          validate_docker_tag() {
+            local t="$1"
+            if [[ ! "$t" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+              echo "::error::Invalid Docker tag (spec: ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$): $t"
+              exit 1
+            fi
+          }
+
           tags=("${GITHUB_SHA}")
+
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            tags+=("${GITHUB_REF#refs/tags/}")
+            git_tag="${GITHUB_REF#refs/tags/}"
+            validate_docker_tag "${git_tag}"
+            tags+=("${git_tag}")
           fi
+
           if [[ -n "${DISPATCH_TAG}" ]]; then
+            validate_docker_tag "${DISPATCH_TAG}"
             tags+=("${DISPATCH_TAG}")
           fi
+
           full=""
           for t in "${tags[@]}"; do
             full+="${ECR_REGISTRY}/${ECR_REPO}:${t},"
