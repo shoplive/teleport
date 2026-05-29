@@ -195,11 +195,21 @@ func pickRedirectURL(c types.OIDCConnector) string {
 }
 
 func joinScopes(extra []string) string {
-	scopes := []string{"openid"}
-	scopes = append(scopes, extra...)
-	seen := make(map[string]struct{}, len(scopes))
-	out := scopes[:0]
-	for _, s := range scopes {
+	scopes := append([]string{"openid"}, extra...)
+	// space-separated per OAuth 2.0 spec.
+	return joinSpace(dedupe(scopes))
+}
+
+// dedupe returns ss with empty strings removed and duplicates collapsed,
+// preserving first-seen order. Extracted so it can be unit-tested
+// independently of joinScopes.
+func dedupe(ss []string) []string {
+	if len(ss) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(ss))
+	out := make([]string, 0, len(ss))
+	for _, s := range ss {
 		if s == "" {
 			continue
 		}
@@ -209,8 +219,7 @@ func joinScopes(extra []string) string {
 		seen[s] = struct{}{}
 		out = append(out, s)
 	}
-	// space-separated per OAuth 2.0 spec.
-	return joinSpace(out)
+	return out
 }
 
 func joinSpace(in []string) string {
