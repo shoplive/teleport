@@ -82,9 +82,9 @@ export function AuthConnectors() {
   // Items hold both GitHub and OIDC connectors merged into one list.
   // Shoplive fork: OIDC is the in-house SSO; we surface both kinds here so
   // operators can see what's actually registered.
-  const [items, setItems] = useState<
-    (Resource<'github'> | Resource<'oidc'>)[]
-  >([]);
+  const [items, setItems] = useState<(Resource<'github'> | Resource<'oidc'>)[]>(
+    []
+  );
   const [defaultConnector, setDefaultConnector] =
     useState<DefaultAuthConnector>();
 
