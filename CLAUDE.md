@@ -34,7 +34,7 @@ Polyglot monorepo:
 
 ## Local dev cluster
 
-For day-to-day Shoplive work, **don't build on the host** — `dev/` runs the entire stack (teleport + Keycloak) in Docker, with the teleport binary built inside `golang:1.24`. The host needs only Docker; no Go / Node / Rust.
+For day-to-day Shoplive work, **don't build on the host** — `dev/` runs the entire stack (teleport + Keycloak) in Docker, with the teleport binary built inside `golang:1.25-bookworm`. The host needs only Docker; no Go / Node / Rust.
 
 ```sh
 cd dev && make up           # build image + start cluster + bootstrap admin

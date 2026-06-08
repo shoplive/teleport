@@ -131,7 +131,12 @@ func (s *Service) validateCallback(ctx context.Context, q url.Values) (*authclie
 		return nil, isMFA, trace.AccessDenied("OIDC nonce mismatch")
 	}
 
-	// Pull claims as a free-form map; merge userinfo if connector requests it.
+	// Pull claims from the id_token as a free-form map, then always fetch
+	// /userinfo and merge it on top. Some IdPs (notably Google) split claims
+	// between the id_token and the userinfo endpoint, so we can't rely on the
+	// id_token alone. A failing /userinfo is demoted to a warning so a flaky
+	// endpoint doesn't block login when the id_token already carries enough
+	// claims.
 	var claims map[string]any
 	if err := idToken.Claims(&claims); err != nil {
 		return nil, isMFA, trace.Wrap(err, "decoding id_token claims")

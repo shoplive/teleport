@@ -37,6 +37,10 @@ services:
   keycloak:
     image: quay.io/keycloak/keycloak:26.0
     container_name: shoplive-keycloak
+    # Run as root so the container can read host-side TLS private keys created
+    # with chmod 600 by dev/scripts/make-pki.sh. Dev-only; in prod Keycloak
+    # runs unprivileged with secrets mounted via the orchestrator.
+    user: "0:0"
     command:
       - start-dev
       - --import-realm

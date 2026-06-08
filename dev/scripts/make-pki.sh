@@ -66,8 +66,13 @@ EOF
     -out teleport/tls.crt -days 825 -sha256 \
     -extfile /tmp/tp.cnf -extensions ext > /dev/null 2>&1
 
-  # Keycloak runs as UID 1000 inside its image; certs need to be readable.
-  chmod 644 keycloak/tls.crt keycloak/tls.key teleport/tls.crt teleport/tls.key ca/ca.crt
+  # Lock down private keys (600) and leave certs world-readable. Keycloak +
+  # Teleport containers must therefore run as root in dev (see docker-compose
+  # `user: "0:0"` on the keycloak service; teleport runs as root by default).
+  # This is a dev-only cluster — keeping host file perms minimal is still
+  # worth the one-line container tweak.
+  chmod 600 keycloak/tls.key teleport/tls.key ca/ca.key
+  chmod 644 keycloak/tls.crt teleport/tls.crt ca/ca.crt
 '
 
 echo
