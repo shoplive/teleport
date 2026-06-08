@@ -83,6 +83,15 @@ RUN --mount=type=cache,id=go-build-${TARGETARCH},target=/root/.cache/go-build \
         build/tctl \
         build/tsh
 
+# Stage empty data_dir + config_dir under /rootfs so the distroless runtime
+# (which has no shell, no `RUN`, no `mkdir`) ships with these paths already
+# present and owned by uid 65532 (the nonroot user). Without this, a vanilla
+# `docker run` of the image fails to start because teleport can't create
+# /var/lib/teleport. On Kubernetes you can still override ownership via
+# `securityContext.fsGroup` when mounting a PVC; this just makes the image
+# correct by default.
+RUN install -d -m 0755 -o 65532 -g 65532 /rootfs/var/lib/teleport /rootfs/etc/teleport
+
 # Distroless base — glibc + ca-certificates only. Public CA bundle handles
 # HTTPS to a real IdP (Keycloak with a real cert) and to AWS / cluster APIs.
 # Runs as the `nonroot` user (uid 65532).
@@ -96,6 +105,13 @@ FROM gcr.io/distroless/base-debian12:nonroot
 COPY --from=builder /src/build/teleport /usr/local/bin/teleport
 COPY --from=builder /src/build/tctl     /usr/local/bin/tctl
 COPY --from=builder /src/build/tsh      /usr/local/bin/tsh
+
+# Pre-staged data_dir / config_dir owned by the nonroot uid (65532). Lets the
+# image start under a plain `docker run` without a host-provisioned volume,
+# and lets Kubernetes mount a PVC on top with `fsGroup: 65532` (or rely on
+# the underlying CSI driver's default ownership).
+COPY --from=builder /rootfs/var/lib/teleport /var/lib/teleport
+COPY --from=builder /rootfs/etc/teleport     /etc/teleport
 
 # 3023 SSH proxy, 3024 reverse-tunnel, 3025 auth API, 3080 proxy web.
 EXPOSE 3023 3024 3025 3080
