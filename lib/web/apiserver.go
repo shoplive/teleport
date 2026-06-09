@@ -1041,6 +1041,13 @@ func (h *Handler) bindDefaultEndpoints() {
 	h.GET("/webapi/github/callback", h.WithMetaRedirect(h.githubCallback))
 	h.POST("/webapi/github/login/console", h.WithLimiter(h.githubLoginConsole))
 
+	// Shoplive fork: in-house OIDC SSO routes. Upstream registers these from
+	// the closed `e/` submodule; we ship our own implementation in lib/web/oidc.go
+	// + lib/auth/oidc/.
+	h.GET("/webapi/oidc/login/web", h.WithRedirect(h.oidcLoginWeb))
+	h.GET("/webapi/oidc/callback", h.WithMetaRedirect(h.oidcCallback))
+	h.POST("/webapi/oidc/login/console", h.WithLimiter(h.oidcLoginConsole))
+
 	// MFA public endpoints.
 	h.POST("/webapi/sites/:site/mfa/required", h.WithClusterAuth(h.isMFARequired))
 	h.POST("/webapi/mfa/login/begin", h.WithLimiter(h.mfaLoginBegin))
@@ -1083,6 +1090,9 @@ func (h *Handler) bindDefaultEndpoints() {
 
 	h.GET("/webapi/github", h.WithAuth(h.getGithubConnectorsHandle))
 	h.POST("/webapi/github", h.WithAuth(h.createGithubConnectorHandle))
+	// Shoplive fork: read-only OIDC connector listing for the Web UI.
+	// Create / update / delete still go through `tctl create -f`.
+	h.GET("/webapi/oidc", h.WithAuth(h.getOIDCConnectorsHandle))
 	// The extra "connector" in the path is to avoid a wildcard conflict with the github handlers used
 	// during the login flow ("github/login/web" and "github/callback").
 	h.GET("/webapi/github/connector/:name", h.WithAuth(h.getGithubConnectorHandle))

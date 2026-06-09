@@ -1,0 +1,167 @@
+# Shoplive Teleport local dev stack — everything runs in Docker, with TLS
+# everywhere via a Shoplive dev root CA.
+#
+#   postgres   stores Keycloak realm/users/credentials (incl. TOTP secrets)
+#   keycloak   IdP, HTTPS at https://keycloak.shoplive.local:8443
+#   teleport   auth + proxy + ssh, HTTPS at https://teleport.shoplive.local:3080
+#
+# The two service hostnames resolve to:
+#   - inside the docker network → the matching container (via network alias)
+#   - on the macOS host         → 127.0.0.1 (via /etc/hosts entry)
+# so the same OIDC issuer / redirect URLs work from both sides — fixing the
+# in-token `iss` claim mismatch.
+#
+# State persistence:
+#   - `make down`     stops containers, KEEPS named volumes (admin TOTP, KC users TOTP)
+#   - `make destroy`  stops containers AND wipes named volumes (clean slate)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: shoplive-postgres
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: keycloak
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      shoplive:
+    restart: unless-stopped
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: shoplive-keycloak
+    # Run as root so the container can read host-side TLS private keys created
+    # with chmod 600 by dev/scripts/make-pki.sh. Dev-only; in prod Keycloak
+    # runs unprivileged with secrets mounted via the orchestrator.
+    user: "0:0"
+    command:
+      - start-dev
+      - --import-realm
+      - --https-port=8443
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+      KC_HOSTNAME: https://keycloak.shoplive.local:8443
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "false"
+      KC_HTTP_ENABLED: "false"
+      KC_HTTPS_CERTIFICATE_FILE: /etc/x509/https/tls.crt
+      KC_HTTPS_CERTIFICATE_KEY_FILE: /etc/x509/https/tls.key
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloak
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./keycloak:/opt/keycloak/data/import:ro
+      - ./pki/keycloak:/etc/x509/https:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      shoplive:
+        aliases:
+          - keycloak.shoplive.local
+    restart: unless-stopped
+
+  teleport:
+    build:
+      context: ..
+      dockerfile: dev/Dockerfile
+    image: shoplive/teleport-dev:latest
+    container_name: shoplive-teleport
+    command: ["start", "--config=/etc/teleport/teleport.yaml"]
+    volumes:
+      - ./teleport.yaml:/etc/teleport/teleport.yaml:ro
+      - ./bootstrap:/etc/teleport/bootstrap:ro
+      - ./pki/teleport:/etc/teleport/tls:ro
+      - teleport_data:/var/lib/teleport
+    ports:
+      - "3023:3023"
+      - "3024:3024"
+      - "3025:3025"
+      - "3080:3080"
+      # tsh SSO callback listener (used with --bind-addr=0.0.0.0:38000
+      # --callback=http://localhost:38000).
+      - "38000:38000"
+    depends_on:
+      - keycloak
+    networks:
+      shoplive:
+        aliases:
+          - teleport.shoplive.local
+    restart: unless-stopped
+
+    develop:
+      watch:
+        - action: rebuild
+          path: ../api
+        - action: rebuild
+          path: ../lib
+        - action: rebuild
+          path: ../tool
+        - action: rebuild
+          path: ../proto
+        - action: rebuild
+          path: ../gen
+        - action: rebuild
+          path: ../session
+        - action: rebuild
+          path: ../go.mod
+        - action: rebuild
+          path: ../go.sum
+        - action: rebuild
+          path: ./teleport.yaml
+
+  # Two SSH agent nodes joining the cluster via static token. They reuse the
+  # same teleport image — just different config + role flags. Once tsh login
+  # succeeds, `tsh ls` shows three nodes (teleport-dev itself + node-1 + node-2)
+  # and `tsh ssh root@node-1` opens a shell inside the node-1 container.
+  node-1:
+    image: shoplive/teleport-dev:latest
+    container_name: shoplive-node-1
+    command: ["start", "--config=/etc/teleport/node.yaml"]
+    volumes:
+      - ./bootstrap/node-1.yaml:/etc/teleport/node.yaml:ro
+      - node1_data:/var/lib/teleport
+    depends_on:
+      - teleport
+    networks:
+      shoplive:
+        aliases:
+          - node-1.shoplive.local
+    restart: unless-stopped
+
+  node-2:
+    image: shoplive/teleport-dev:latest
+    container_name: shoplive-node-2
+    command: ["start", "--config=/etc/teleport/node.yaml"]
+    volumes:
+      - ./bootstrap/node-2.yaml:/etc/teleport/node.yaml:ro
+      - node2_data:/var/lib/teleport
+    depends_on:
+      - teleport
+    networks:
+      shoplive:
+        aliases:
+          - node-2.shoplive.local
+    restart: unless-stopped
+
+networks:
+  shoplive:
+    name: shoplive
+
+volumes:
+  teleport_data:
+  postgres_data:
+  node1_data:
+  node2_data:

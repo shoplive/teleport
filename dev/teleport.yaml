@@ -1,0 +1,49 @@
+version: v3
+teleport:
+  nodename: teleport-dev
+  data_dir: /var/lib/teleport
+  log:
+    severity: INFO
+    output: stderr
+    format:
+      output: text
+
+auth_service:
+  enabled: yes
+  listen_addr: 0.0.0.0:3025
+  cluster_name: shoplive.local
+  proxy_listener_mode: multiplex
+  # Static join tokens for in-compose agent containers (node, kube, db, app).
+  # Dev only — production uses short-lived dynamic tokens via tctl tokens add
+  # or IAM joining. Match the auth_token in dev/bootstrap/node-*.yaml.
+  tokens:
+    - "node,kube,db,app:dev-static-shoplive-token"
+  authentication:
+    # OIDCService is fully implemented (lib/auth/oidc) and `tsh login
+    # --auth=keycloak` works end-to-end. We deliberately keep `type: local`
+    # as the default in dev so there's always a break-glass path (local
+    # tctl-created admin) when Keycloak is rebuilt / wiped / misconfigured.
+    # Production sets `type: oidc` with `connector_name: keycloak` instead.
+    type: local
+    second_factors:
+      - otp
+    webauthn:
+      rp_id: localhost
+
+proxy_service:
+  enabled: yes
+  web_listen_addr: 0.0.0.0:3080
+  listen_addr: 0.0.0.0:3023
+  tunnel_listen_addr: 0.0.0.0:3024
+  public_addr: ["teleport.shoplive.local:3080"]
+  acme:
+    enabled: false
+  https_keypairs:
+    - cert_file: /etc/teleport/tls/tls.crt
+      key_file: /etc/teleport/tls/tls.key
+
+ssh_service:
+  enabled: yes
+  labels:
+    env: dev
+    role: bootstrap

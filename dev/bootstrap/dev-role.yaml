@@ -1,0 +1,41 @@
+kind: role
+version: v7
+metadata:
+  name: shoplive-dev
+  description: Non-admin developer role (mapped from teleport-devs Keycloak group).
+spec:
+  options:
+    max_session_ttl: 8h0m0s
+    forward_agent: true
+  allow:
+    # Devs SSH as their own IdP username (e.g. "alice") or as the generic
+    # "ubuntu" account. No root.
+    logins:
+      - '{{external.preferred_username}}'
+      - ubuntu
+    node_labels:
+      env: dev
+
+    # Kubernetes — dev gets the built-in `view` ClusterRole (read-only on
+    # all resources in cluster) on `env=dev` clusters only.
+    kubernetes_labels:
+      env: dev
+    kubernetes_groups:
+      - view
+    kubernetes_users:
+      - '{{external.preferred_username}}'
+
+    # Database — list+connect as own user on `env=dev` databases.
+    db_labels:
+      env: dev
+    db_users:
+      - '{{external.preferred_username}}'
+    db_names:
+      - '*'
+
+    rules:
+      # Read-only on most resources; can list and join sessions.
+      - resources: [node, kube_cluster, db, app]
+        verbs: [list, read]
+      - resources: [session_tracker]
+        verbs: [list, read]

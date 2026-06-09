@@ -1,0 +1,21 @@
+version: v3
+teleport:
+  nodename: node-2
+  data_dir: /var/lib/teleport
+  auth_token: dev-static-shoplive-token
+  proxy_server: teleport.shoplive.local:3080
+  log:
+    severity: INFO
+    output: stderr
+
+auth_service:
+  enabled: no
+proxy_service:
+  enabled: no
+
+ssh_service:
+  enabled: yes
+  labels:
+    env: dev
+    role: db
+    zone: b

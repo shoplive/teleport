@@ -93,6 +93,7 @@ import (
 	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/auth/keygen"
 	"github.com/gravitational/teleport/lib/auth/keystore"
+	authoidc "github.com/gravitational/teleport/lib/auth/oidc"
 	"github.com/gravitational/teleport/lib/auth/keystore/health"
 	"github.com/gravitational/teleport/lib/auth/machineid/machineidv1"
 	"github.com/gravitational/teleport/lib/auth/recordingencryption"
@@ -2524,6 +2525,15 @@ func (process *TeleportProcess) initAuthService() error {
 	// setLocalAuth must be called before InitUsageReporting so that enterprise
 	// auth extensions can access the UsageReporter via GetAuthServer.
 	process.setLocalAuth(authServer)
+
+	// Shoplive fork: register the in-house OIDC SSO implementation. Upstream
+	// gates this behind the `e/` enterprise submodule; we ship our own RP under
+	// lib/auth/oidc instead. See CLAUDE.md / SKILLS.md / lib/auth/oidc.
+	authServer.SetOIDCService(authoidc.New(
+		authServer,
+		process.logger.With(teleport.ComponentKey, teleport.Component(teleport.ComponentAuth, "oidc", process.id)),
+	))
+
 	if process.Config.PluginRegistry != nil {
 		if err := process.Config.PluginRegistry.InitUsageReporting(process); err != nil {
 			return trace.Wrap(err, "initializing usage reporting")

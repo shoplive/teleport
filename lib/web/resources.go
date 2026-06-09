@@ -287,6 +287,37 @@ func getGithubConnectors(ctx context.Context, clt resourcesAPIGetter) ([]ui.Reso
 	return ui.NewGithubConnectors(connectors)
 }
 
+// getOIDCConnectors lists OIDC connectors and packs them as Web-UI ResourceItems.
+// Shoplive fork — counterpart of getGithubConnectors for the in-house OIDC RP.
+func getOIDCConnectors(ctx context.Context, clt resourcesAPIGetter) ([]ui.ResourceItem, error) {
+	connectors, err := clientutils.CollectWithFallback(ctx,
+		func(ctx context.Context, limit int, start string) ([]types.OIDCConnector, string, error) {
+			return clt.ListOIDCConnectors(ctx, limit, start, false /* withSecrets */)
+		},
+		func(ctx context.Context) ([]types.OIDCConnector, error) {
+			return clt.GetOIDCConnectors(ctx, false /* withSecrets */)
+		},
+	)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return ui.NewOIDCConnectors(connectors)
+}
+
+// getOIDCConnectorsHandle is the HTTP handler for `GET /webapi/oidc`.
+// Returns the list of OIDC connectors (without client_secret). Read-only.
+func (h *Handler) getOIDCConnectorsHandle(w http.ResponseWriter, r *http.Request, params httprouter.Params, ctx *SessionContext) (any, error) {
+	clt, err := ctx.GetClient()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	connectors, err := getOIDCConnectors(r.Context(), clt)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return &ui.ListAuthConnectorsResponse{Connectors: connectors}, nil
+}
+
 func (h *Handler) deleteGithubConnector(w http.ResponseWriter, r *http.Request, params httprouter.Params, ctx *SessionContext) (any, error) {
 	clt, err := ctx.GetClient()
 	if err != nil {
@@ -701,6 +732,10 @@ type resourcesAPIGetter interface {
 	GetGithubConnector(ctx context.Context, id string, withSecrets bool) (types.GithubConnector, error)
 	// DeleteGithubConnector deletes the specified Github connector
 	DeleteGithubConnector(ctx context.Context, id string) error
+	// GetOIDCConnectors returns all configured OIDC connectors (Shoplive fork).
+	GetOIDCConnectors(ctx context.Context, withSecrets bool) ([]types.OIDCConnector, error)
+	// ListOIDCConnectors returns a page of valid registered OIDC connectors.
+	ListOIDCConnectors(ctx context.Context, limit int, start string, withSecrets bool) ([]types.OIDCConnector, string, error)
 	// UpsertTrustedCluster creates or updates a TrustedCluster in the backend.
 	UpsertTrustedCluster(ctx context.Context, tc types.TrustedCluster) (types.TrustedCluster, error)
 	// GetTrustedCluster returns a single TrustedCluster by name.

@@ -101,6 +101,14 @@ class ResourceService {
       }));
   }
 
+  // Shoplive fork: read-only OIDC connector listing. Create / update / delete
+  // still go through `tctl create -f` (no editor in the OSS UI).
+  async fetchOIDCConnectors(): Promise<{ connectors: Resource<'oidc'>[] }> {
+    return api.get(cfg.getOIDCConnectorsUrl()).then(res => ({
+      connectors: makeResourceList<'oidc'>(res.connectors || []),
+    }));
+  }
+
   async setDefaultAuthConnector(
     req: DefaultAuthConnector | { type: 'local' },
     abortSignal?: AbortSignal

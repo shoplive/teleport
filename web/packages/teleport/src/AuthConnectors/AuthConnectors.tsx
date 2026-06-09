@@ -41,7 +41,6 @@ import useTeleport from 'teleport/useTeleport';
 
 import { GitHubConnectorEditor } from './AuthConnectorEditor';
 import { ConnectorList } from './ConnectorList';
-import { CtaConnectors } from './ConnectorList/CTAConnectors';
 import DeleteConnectorDialog from './DeleteConnectorDialog';
 import EmptyList from './EmptyList';
 import templates from './templates';
@@ -80,16 +79,27 @@ export function AuthConnectorsContainer() {
  */
 export function AuthConnectors() {
   const ctx = useTeleport();
-  const [items, setItems] = useState<Resource<'github'>[]>([]);
+  // Items hold both GitHub and OIDC connectors merged into one list.
+  // Shoplive fork: OIDC is the in-house SSO; we surface both kinds here so
+  // operators can see what's actually registered.
+  const [items, setItems] = useState<(Resource<'github'> | Resource<'oidc'>)[]>(
+    []
+  );
   const [defaultConnector, setDefaultConnector] =
     useState<DefaultAuthConnector>();
 
   const [fetchAttempt, fetchConnectors] = useAsync(
     useCallback(async () => {
-      return await ctx.resourceService.fetchGithubConnectors().then(res => {
-        setItems(res.connectors);
-        setDefaultConnector(res.defaultConnector);
-      });
+      const [github, oidc] = await Promise.all([
+        ctx.resourceService.fetchGithubConnectors(),
+        // OIDC listing is read-only and may not be permitted for every user;
+        // tolerate failure and just skip the OIDC entries in that case.
+        ctx.resourceService
+          .fetchOIDCConnectors()
+          .catch(() => ({ connectors: [] as Resource<'oidc'>[] })),
+      ]);
+      setItems([...github.connectors, ...oidc.connectors]);
+      setDefaultConnector(github.defaultConnector);
     }, [ctx.resourceService])
   );
 
@@ -188,7 +198,6 @@ export function AuthConnectors() {
                 />
               )}
             </Box>
-            <CtaConnectors />
           </Flex>
         </Flex>
       )}

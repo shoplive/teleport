@@ -1,0 +1,35 @@
+# Build context = repo root. Conservative — only exclude things that are
+# definitely not on teleport's import graph or are big regenerable artifacts.
+# Anything excluded here is invisible inside the builder stage.
+#
+# Notes:
+#   - integrations/ MUST stay in (lib/web/integrations.go imports msteams).
+#   - e/ is the empty enterprise submodule; e_imports.go is gated on a tag
+#     that's never set, so excluding it is safe.
+
+.git
+.github
+
+# Build outputs (regenerable)
+build/
+target/
+
+# JS output / deps
+node_modules/
+**/node_modules/
+web/packages/*/dist/
+webassets/
+
+# Empty enterprise submodule — never compiled in this fork
+e/
+
+# Dev runtime (but KEEP dev/pki — runtime stage copies the root CA from there)
+dev/data/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+*.log
+*.pid
+*.swp

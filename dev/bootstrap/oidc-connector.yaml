@@ -1,0 +1,35 @@
+# Apply with: make bootstrap-oidc
+#
+# This resource will be accepted by the auth server (CRUD lives in OSS), but
+# logins will fail with "OIDC is only available in enterprise subscriptions"
+# until the OIDCService implementation is wired in via SetOIDCService.
+kind: oidc
+version: v3
+metadata:
+  name: keycloak
+spec:
+  display: Keycloak
+  issuer_url: https://keycloak.shoplive.local:8443/realms/shoplive
+  client_id: teleport-proxy
+  client_secret: teleport-dev-secret
+  redirect_url: https://teleport.shoplive.local:3080/v1/webapi/oidc/callback
+  # `openid` is added unconditionally by lib/auth/oidc/service.go. The realm
+  # JSON declares `email`, `profile`, `groups` as proper client scopes with
+  # their own protocol mappers (see dev/keycloak/realm-shoplive.json), so
+  # requesting them here causes Keycloak to attach those mappers and emit the
+  # corresponding claims (`email`, `preferred_username`, `groups`, ...) on the
+  # id_token / userinfo.
+  scope:
+    - email
+    - profile
+    - groups
+  pkce_mode: enabled
+  prompt: login
+  username_claim: preferred_username
+  claims_to_roles:
+    - claim: groups
+      value: teleport-admins
+      roles: [shoplive-admin]
+    - claim: groups
+      value: teleport-devs
+      roles: [shoplive-dev]

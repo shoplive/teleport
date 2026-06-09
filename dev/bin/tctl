@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Host-side wrapper that runs `tctl` against the local shoplive-teleport cluster.
+# Pre-applies -c so resource commands work without a host config.
+#
+#   alias tctl="$REPO/dev/bin/tctl"
+#   # or
+#   export PATH="$REPO/dev/bin:$PATH"
+
+set -euo pipefail
+
+DEV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if ! (cd "$DEV_DIR" && docker compose ps --status running --services 2>/dev/null | grep -q '^teleport$'); then
+  echo "ERROR: shoplive-teleport container is not running. Run 'make up' in $DEV_DIR." >&2
+  exit 1
+fi
+
+EXEC_FLAGS=()
+if [[ -t 1 ]]; then
+  EXEC_FLAGS+=(-t)
+fi
+
+exec docker compose -f "$DEV_DIR/docker-compose.yml" exec "${EXEC_FLAGS[@]}" teleport \
+  tctl -c /etc/teleport/teleport.yaml "$@"

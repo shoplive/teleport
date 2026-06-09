@@ -138,6 +138,10 @@ func NewAPIServer(config *APIConfig) (http.Handler, error) {
 
 	// SSO validation handlers
 	srv.POST("/:version/github/requests/validate", srv.WithAuth(srv.validateGithubAuthCallback))
+	// Shoplive fork: OIDC SSO validation. Upstream registers this from the
+	// closed `e/` submodule; we ship our own auth-side handler that calls
+	// our in-house OIDCService implementation in lib/auth/oidc.
+	srv.POST("/:version/oidc/requests/validate", srv.WithAuth(srv.validateOIDCAuthCallback))
 
 	// Migrated/deleted endpoints with 501 Not Implemented handlers.
 	srv.POST("/:version/reversetunnels", httpMigratedHandler)
@@ -470,6 +474,52 @@ func (s *APIServer) validateGithubAuthCallback(auth *ServerWithRoles, w http.Res
 		Cert:          response.Cert,
 		TLSCert:       response.TLSCert,
 		Req:           response.Req,
+		ClientOptions: response.ClientOptions,
+	}
+	if response.Session != nil {
+		rawSession, err := services.MarshalWebSession(
+			response.Session, services.WithVersion(version), services.PreserveRevision())
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		raw.Session = rawSession
+	}
+	raw.HostSigners = make([]json.RawMessage, len(response.HostSigners))
+	for i, ca := range response.HostSigners {
+		data, err := services.MarshalCertAuthority(
+			ca, services.WithVersion(version), services.PreserveRevision())
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		raw.HostSigners[i] = data
+	}
+	return &raw, nil
+}
+
+// validateOIDCAuthCallback is the auth-server side of the OIDC SSO flow.
+// The proxy POSTs the IdP callback's query parameters here; we forward them
+// to the in-house OIDCService implementation (lib/auth/oidc) and serialize
+// the resulting session/cert response back over JSON.
+//
+//	POST /:version/oidc/requests/validate
+//
+//	Success response: authclient.OIDCAuthRawResponse
+func (s *APIServer) validateOIDCAuthCallback(auth *ServerWithRoles, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (any, error) {
+	var req authclient.ValidateOIDCAuthCallbackReq
+	if err := httplib.ReadJSON(r, &req); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	response, err := auth.ValidateOIDCAuthCallback(r.Context(), req.Query)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	raw := authclient.OIDCAuthRawResponse{
+		Username:      response.Username,
+		Identity:      response.Identity,
+		Cert:          response.Cert,
+		TLSCert:       response.TLSCert,
+		Req:           response.Req,
+		MFAToken:      response.MFAToken,
 		ClientOptions: response.ClientOptions,
 	}
 	if response.Session != nil {

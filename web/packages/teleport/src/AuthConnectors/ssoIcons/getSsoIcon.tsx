@@ -126,6 +126,16 @@ function guessIconFromName(connectorName: string) {
       </Flex>
     );
   }
+  // Shoplive fork: Keycloak doesn't ship its own asset upstream; the
+  // openid logo is the next best fit and clearly identifies an OIDC
+  // connector in the list.
+  if (name.includes('keycloak')) {
+    return () => (
+      <Flex height="61px" alignItems="center" justifyContent="center">
+        <ResourceIcon name="openid" width="61px" />
+      </Flex>
+    );
+  }
 }
 
 const MultiIconContainer = styled(Flex)`

@@ -1,0 +1,40 @@
+# Build context = repo root. Conservative — only exclude things that are
+# definitely not on teleport's import graph or are big regenerable artifacts.
+# Anything excluded here is invisible inside the builder stage.
+#
+# Notes:
+#   - integrations/ MUST stay in (lib/web/integrations.go imports msteams).
+#   - e/ is the empty enterprise submodule; e_imports.go is gated on a tag
+#     that's never set, so excluding it is safe.
+#   - dev/ is the local-cluster scaffold (compose / pki / kind / bootstrap)
+#     and is never referenced from production binaries — excluded wholesale.
+
+.git
+.github
+
+# Build outputs (regenerable)
+build/
+target/
+
+# JS output / deps
+node_modules/
+**/node_modules/
+web/packages/*/dist/
+webassets/
+
+# Empty enterprise submodule — never compiled in this fork
+e/
+
+# Local dev cluster scaffold (compose, pki, kind, bootstrap scripts)
+dev/
+
+# Claude agent scratch space (worktrees, plans, memory)
+.claude/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+*.log
+*.pid
+*.swp

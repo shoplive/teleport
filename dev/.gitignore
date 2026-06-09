@@ -1,0 +1,5 @@
+data/
+pki/
+*.log
+*.pid
+.bootstrapped
