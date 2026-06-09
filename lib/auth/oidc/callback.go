@@ -132,11 +132,13 @@ func (s *Service) validateCallback(ctx context.Context, q url.Values) (*authclie
 	}
 
 	// Pull claims from the id_token as a free-form map, then always fetch
-	// /userinfo and merge in only missing keys. Some IdPs (notably Google) split claims
+	// /userinfo to augment them. Some IdPs (notably Google) split claims
 	// between the id_token and the userinfo endpoint, so we can't rely on the
-	// id_token alone. A failing /userinfo is demoted to a warning so a flaky
-	// endpoint doesn't block login when the id_token already carries enough
-	// claims.
+	// id_token alone. Merge semantics: id_token claims are authoritative —
+	// mergeUserInfo only adds keys from /userinfo that are not already
+	// present in claims, it never overwrites existing values. A failing
+	// /userinfo is demoted to a warning so a flaky endpoint doesn't block
+	// login when the id_token already carries enough claims.
 	var claims map[string]any
 	if err := idToken.Claims(&claims); err != nil {
 		return nil, isMFA, trace.Wrap(err, "decoding id_token claims")
@@ -485,6 +487,8 @@ func verifyMFAUsernameMatch(expectedFromSession, idpUsername string) error {
 
 // mergeUserInfo augments id_token claims with /userinfo fields. Some IdPs
 // (Google in particular) split claims between the ID token and userinfo.
+// Existing id_token keys are preserved as authoritative — only keys not
+// already present in claims are copied from userinfo.
 func mergeUserInfo(ctx context.Context, p *oidc.Provider, tok *oauth2.Token, claims *map[string]any) error {
 	ui, err := p.UserInfo(ctx, oauth2.StaticTokenSource(tok))
 	if err != nil {

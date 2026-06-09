@@ -22,6 +22,14 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 #                       wasm-opt (0.116.1) so the upstream Makefile's version
 #                       checks short-circuit instead of doing 10+ min cargo
 #                       installs from source.
+#
+# NodeSource is installed via a GPG-signed apt repository instead of the
+# `curl … | bash` setup script — same end result, but apt verifies the
+# signature on every package fetch, so an upstream script tamper or MITM
+# can't silently swap the install path. Kept in sync with the production
+# Dockerfile. Rustup + cargo-binstall still use `curl | sh`; tracked
+# separately (rustup's install path is its only upstream-supported channel
+# and pinning cargo-binstall requires a different fetch model).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         git \
@@ -34,8 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && chmod 0644 /usr/share/keyrings/nodesource.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main" \
         > /etc/apt/sources.list.d/nodesource.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends nodejs \
+    && apt-get update && apt-get install -y --no-install-recommends nodejs \
     && corepack enable \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
         sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.94.0 \
