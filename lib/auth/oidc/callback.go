@@ -132,7 +132,7 @@ func (s *Service) validateCallback(ctx context.Context, q url.Values) (*authclie
 	}
 
 	// Pull claims from the id_token as a free-form map, then always fetch
-	// /userinfo and merge it on top. Some IdPs (notably Google) split claims
+	// /userinfo and merge in only missing keys. Some IdPs (notably Google) split claims
 	// between the id_token and the userinfo endpoint, so we can't rely on the
 	// id_token alone. A failing /userinfo is demoted to a warning so a flaky
 	// endpoint doesn't block login when the id_token already carries enough
@@ -502,4 +502,3 @@ func mergeUserInfo(ctx context.Context, p *oidc.Provider, tok *oauth2.Token, cla
 	}
 	return nil
 }
-
